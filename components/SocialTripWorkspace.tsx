@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useCallback } from "react";
 import DynamicLeafletMap from "./map/DynamicMap";
 import { FocusedStop } from "./map/LeafletMap";
-import { ActivityItem, ItineraryData } from "@/lib/schema";
+import { ActivityCategory, ActivityItem, ItineraryData } from "@/lib/schema";
 import { PRESET_SUMMARIES } from "@/lib/presets";
 import {
   Navigation,
@@ -13,6 +13,8 @@ import {
   History,
   Trash2,
   ChevronRight,
+  ChevronDown,
+  ChevronUp,
   Plus,
   Calendar,
   MapPin,
@@ -27,6 +29,14 @@ import {
   CheckCircle2,
   Compass,
   X,
+  Route,
+  Clock,
+  Utensils,
+  Landmark,
+  Ticket,
+  BedDouble,
+  FileText,
+  AlertCircle,
 } from "lucide-react";
 
 const HISTORY_IDS_STORAGE_KEY = "cool_wanderer_history_ids";
@@ -160,6 +170,26 @@ function renderTransitIcon(iconName: string) {
   }
 }
 
+function renderCategoryIcon(
+  category: ActivityCategory,
+  badgeTone: string | undefined
+) {
+  if (badgeTone === "sunset") {
+    return <Sun className="w-3 h-3 shrink-0" />;
+  }
+  switch (category) {
+    case "food":
+      return <Utensils className="w-3 h-3 shrink-0" />;
+    case "sightseeing":
+      return <Landmark className="w-3 h-3 shrink-0" />;
+    case "stay":
+      return <BedDouble className="w-3 h-3 shrink-0" />;
+    case "activity":
+    default:
+      return <Ticket className="w-3 h-3 shrink-0" />;
+  }
+}
+
 export default function SocialTripWorkspace() {
   const [itinerary, setItinerary] = useState<ItineraryData | null>(null);
   const [activeRecordId, setActiveRecordId] = useState<string | null>(null);
@@ -248,7 +278,6 @@ export default function SocialTripWorkspace() {
     const cachedRecords = getCachedRecordsFromLocalStorage();
     const savedIds = getSavedIdsFromLocalStorage();
 
-    // Ensure savedIds includes any cached record IDs
     const mergedIds = Array.from(
       new Set([...savedIds, ...cachedRecords.map((r) => r.id)])
     ).slice(0, 25);
@@ -257,7 +286,6 @@ export default function SocialTripWorkspace() {
       saveIdsToLocalStorage(mergedIds);
     }
 
-    // Immediately show localStorage cached records so refresh never loses data
     if (cachedRecords.length > 0) {
       setHistoryRecords(cachedRecords);
     }
@@ -275,7 +303,6 @@ export default function SocialTripWorkspace() {
       if (res.ok) {
         const data = await res.json();
         if (Array.isArray(data.records) && data.records.length > 0) {
-          // Merge server DB records with localStorage cache (preserving order in mergedIds)
           const recordMap = new Map<string, HistoryRecord>();
           for (const rec of cachedRecords) {
             recordMap.set(rec.id, rec);
@@ -315,13 +342,11 @@ export default function SocialTripWorkspace() {
           : null;
       const targetId = params?.get("id") || getActiveIdFromLocalStorage();
 
-      // 1. Instant restore from localStorage cache if targetId exists
       if (targetId) {
         const cachedMatch = localCache.find((r) => r.id === targetId);
         if (cachedMatch && isMounted) {
           applyItinerary(cachedMatch.itinerary, cachedMatch.id, 1);
         } else {
-          // Try fetching single ID from DB (e.g. shared URL link)
           try {
             const res = await fetch(
               `/api/itineraries?id=${encodeURIComponent(targetId)}`
@@ -345,7 +370,6 @@ export default function SocialTripWorkspace() {
         }
       }
 
-      // 2. Sync full history list
       await hydrateAndSyncHistory();
     }
 
@@ -781,11 +805,19 @@ export default function SocialTripWorkspace() {
                 <button
                   type="button"
                   onClick={() => setShowManualCaption((prev) => !prev)}
-                  className="text-xs text-primary hover:underline font-medium"
+                  className="inline-flex items-center gap-1.5 text-xs text-primary hover:underline font-medium"
                 >
-                  {showManualCaption
-                    ? "Tutup input caption manual"
-                    : "+ Tempel transkrip / caption manual"}
+                  <FileText className="w-3.5 h-3.5 shrink-0" />
+                  <span>
+                    {showManualCaption
+                      ? "Tutup input caption manual"
+                      : "Tempel transkrip / caption manual"}
+                  </span>
+                  {showManualCaption ? (
+                    <ChevronUp className="w-3.5 h-3.5 shrink-0" />
+                  ) : (
+                    <ChevronDown className="w-3.5 h-3.5 shrink-0" />
+                  )}
                 </button>
               </div>
 
@@ -800,8 +832,9 @@ export default function SocialTripWorkspace() {
               )}
 
               {errorMsg && (
-                <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-xs text-error font-medium leading-relaxed">
-                  {errorMsg}
+                <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-xs text-error font-medium leading-relaxed flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 text-error shrink-0 mt-0.5" />
+                  <span>{errorMsg}</span>
                 </div>
               )}
             </form>
@@ -818,9 +851,10 @@ export default function SocialTripWorkspace() {
                     type="button"
                     disabled={isGenerating}
                     onClick={() => handleSelectPreset(p.id)}
-                    className="px-3.5 py-1.5 rounded-full bg-slate-100 hover:bg-slate-200/80 text-xs font-semibold text-slate-700 transition-colors"
+                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full bg-slate-100 hover:bg-slate-200/80 text-xs font-semibold text-slate-700 transition-colors"
                   >
-                    {p.label}
+                    <Compass className="w-3.5 h-3.5 text-primary shrink-0" />
+                    <span>{p.label}</span>
                   </button>
                 ))}
               </div>
@@ -877,8 +911,11 @@ export default function SocialTripWorkspace() {
                             </span>
                           </div>
                           <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-slate-500 mt-0.5">
-                            <span className="truncate max-w-[140px] sm:max-w-none">
-                              {rec.itinerary.destination}
+                            <span className="inline-flex items-center gap-1 truncate max-w-[140px] sm:max-w-none">
+                              <MapPin className="w-3 h-3 text-primary shrink-0" />
+                              <span className="truncate">
+                                {rec.itinerary.destination}
+                              </span>
                             </span>
                             <span>•</span>
                             <span className="whitespace-nowrap">
@@ -1099,15 +1136,18 @@ export default function SocialTripWorkspace() {
                   key={dayObj.day}
                   type="button"
                   onClick={() => setActiveDay(dayObj.day)}
-                  className={`shrink-0 px-4 py-1.5 rounded-full text-xs font-semibold transition-all whitespace-nowrap ${
+                  className={`shrink-0 px-3.5 py-1.5 rounded-full text-xs font-semibold transition-all whitespace-nowrap inline-flex items-center gap-1.5 ${
                     isSelected
                       ? "bg-primary text-on-primary shadow-sm font-bold"
                       : "bg-surface-container-low text-on-surface-variant hover:bg-surface-container"
                   }`}
                 >
-                  {isSelected
-                    ? `Hari ${dayObj.day} (Aktif)`
-                    : `Hari ${dayObj.day} • ${dateText}`}
+                  <Calendar className="w-3.5 h-3.5 shrink-0" />
+                  <span>
+                    {isSelected
+                      ? `Hari ${dayObj.day} (Aktif)`
+                      : `Hari ${dayObj.day} • ${dateText}`}
+                  </span>
                 </button>
               );
             })}
@@ -1124,6 +1164,7 @@ export default function SocialTripWorkspace() {
                       {currentDayPlan.title}
                     </h1>
                     <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-surface-container-highest text-[11px] font-bold text-primary shrink-0">
+                      <Route className="w-3 h-3 shrink-0" />
                       <span>
                         {currentDayPlan.efficiencyLabel || "Rute Searah"}
                       </span>
@@ -1246,13 +1287,14 @@ export default function SocialTripWorkspace() {
                               <div className="flex-1 min-w-0 flex flex-col gap-1">
                                 <div className="flex flex-wrap items-center justify-between gap-1.5">
                                   <span
-                                    className={`text-xs font-bold whitespace-nowrap ${
+                                    className={`inline-flex items-center gap-1 text-xs font-bold whitespace-nowrap ${
                                       isOrange
                                         ? "text-secondary-container"
                                         : "text-primary"
                                     }`}
                                   >
-                                    {act.time}
+                                    <Clock className="w-3 h-3 shrink-0" />
+                                    <span>{act.time}</span>
                                   </span>
 
                                   <span
@@ -1263,8 +1305,9 @@ export default function SocialTripWorkspace() {
                                         : "bg-surface-container-high text-on-surface-variant"
                                     }`}
                                   >
-                                    {badgeTone === "sunset" && (
-                                      <Sun className="w-3 h-3 shrink-0" />
+                                    {renderCategoryIcon(
+                                      act.category,
+                                      badgeTone
                                     )}
                                     <span className="truncate">
                                       {badgeLabel}
