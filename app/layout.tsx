@@ -12,6 +12,15 @@ export const metadata: Metadata = {
   title: "Cool Wanderer — AI Social Media Itinerary Generator",
   description:
     "Cool Wanderer mengubah video TikTok, Instagram Reels, & YouTube Shorts menjadi jadwal itinerary harian terstruktur dan peta rute interaktif.",
+  icons: {
+    icon: [
+      { url: "/icon.png", type: "image/png" },
+    ],
+    shortcut: ["/icon.png"],
+    apple: [
+      { url: "/icon.png", type: "image/png" },
+    ],
+  },
 };
 
 export default function RootLayout({

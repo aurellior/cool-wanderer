@@ -3,7 +3,9 @@ import {
   deleteItineraryFromDb,
   getItinerariesByIdsFromDb,
   getItineraryByIdFromDb,
+  saveItineraryToDb,
 } from "@/lib/db";
+import { ItinerarySchema } from "@/lib/schema";
 
 export async function GET(req: NextRequest) {
   try {
@@ -36,6 +38,29 @@ export async function GET(req: NextRequest) {
     console.error("Error in GET /api/itineraries:", error);
     return NextResponse.json(
       { error: "Gagal mengambil data riwayat dari database." },
+      { status: 500 }
+    );
+  }
+}
+
+export async function PUT(req: NextRequest) {
+  try {
+    const body = await req.json();
+    const { itinerary } = body as { itinerary?: unknown };
+    if (!itinerary) {
+      return NextResponse.json(
+        { error: "Data itinerary diperlukan." },
+        { status: 400 }
+      );
+    }
+
+    const validated = ItinerarySchema.parse(itinerary);
+    const saved = await saveItineraryToDb(validated);
+    return NextResponse.json({ record: saved });
+  } catch (error) {
+    console.error("Error in PUT /api/itineraries:", error);
+    return NextResponse.json(
+      { error: "Gagal menyimpan perubahan itinerary ke database." },
       { status: 500 }
     );
   }

@@ -9,6 +9,7 @@ import { Maximize2 } from "lucide-react";
 export interface FocusedStop {
   day: number;
   activityIndex: number;
+  candidateId?: string;
   timestamp: number;
 }
 
@@ -17,6 +18,7 @@ interface LeafletMapProps {
   selectedDay: number | "all";
   focusedStop: FocusedStop | null;
   onSelectActivity?: (day: number, activityIndex: number) => void;
+  onAddCandidate?: (candidate: ActivityItem) => void;
   onOpenGoogleMapsRoute?: () => void;
 }
 
@@ -43,11 +45,17 @@ export default function LeafletMap({
   selectedDay,
   focusedStop,
   onSelectActivity,
+  onAddCandidate,
 }: LeafletMapProps) {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapInstanceRef = useRef<L.Map | null>(null);
   const layerGroupRef = useRef<L.LayerGroup | null>(null);
   const markersMapRef = useRef<Map<string, L.Marker>>(new Map());
+  const onAddCandidateRef = useRef(onAddCandidate);
+
+  useEffect(() => {
+    onAddCandidateRef.current = onAddCandidate;
+  }, [onAddCandidate]);
 
   useEffect(() => {
     const container = mapContainerRef.current;
@@ -72,7 +80,6 @@ export default function LeafletMap({
     mapInstanceRef.current = map;
     layerGroupRef.current = layerGroup;
 
-    // Keep map size synced when container resizes or toggles visibility
     const resizeObserver = new ResizeObserver(() => {
       map.invalidateSize();
     });
@@ -101,18 +108,20 @@ export default function LeafletMap({
 
     const allBoundsPoints: L.LatLngExpression[] = [];
     const placedPositions: { lat: number; lng: number }[] = [];
+    const addedPlaceNames = new Set<string>();
     let globalOrder = 1;
 
+    // 1. Plot Added Activities in Days (Numbered Route Pins + Polyline)
     filteredDays.forEach((dayPlan) => {
       const dayCoords: L.LatLngExpression[] = [];
 
       dayPlan.activities.forEach((act: ActivityItem, actIdx: number) => {
+        addedPlaceNames.add(act.placeName.toLowerCase().trim());
         const rawLat = act.location.lat;
         const rawLng = act.location.lng;
         const { address } = act.location;
         if (typeof rawLat !== "number" || typeof rawLng !== "number") return;
 
-        // Prevent markers from stacking directly on top of each other if coordinates are identical/too close
         let displayLat = rawLat;
         let displayLng = rawLng;
         const nearbyCount = placedPositions.filter(
@@ -169,10 +178,15 @@ export default function LeafletMap({
           `${act.placeName} ${address}`
         )}`;
 
+        const timeMetaText = act.time?.trim()
+          ? escapeHtml(act.time.trim())
+          : `Urutan #${stopNumber}`;
+        const cityMetaText = act.city ? ` • ${escapeHtml(act.city)}` : "";
+
         const popupHtml = `
           <div style="font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif; min-width: 190px; max-width: 240px; padding: 2px;">
             <div style="font-size: 11px; color: #64748b; margin-bottom: 3px; font-weight: 600;">
-              Hari ${dayPlan.day} • ${escapeHtml(act.time)}
+              Hari ${dayPlan.day}${cityMetaText} • ${timeMetaText}
             </div>
             <div style="font-weight: 700; font-size: 13.5px; color: #0f172a; margin-bottom: 4px; line-height: 1.3;">
               ${stopNumber}. ${escapeHtml(act.placeName)}
@@ -199,7 +213,7 @@ export default function LeafletMap({
 
         const marker = L.marker(latLng, {
           icon: customIcon,
-          zIndexOffset: stopNumber * 10,
+          zIndexOffset: stopNumber * 20 + 100,
         }).bindPopup(popupHtml, { maxWidth: 250 });
 
         marker.on("click", () => {
@@ -214,14 +228,147 @@ export default function LeafletMap({
         L.polyline(dayCoords, {
           color: "#005c55",
           weight: 3.5,
-          opacity: 0.8,
+          opacity: 0.85,
           dashArray: "6, 8",
         }).addTo(layerGroup);
       }
     });
 
-    if (allBoundsPoints.length > 0) {
-      const bounds = L.latLngBounds(allBoundsPoints);
+    // 2. Also plot Unadded Candidate Destinations from candidatePlaces as Preview (+) Markers
+    const allDaysAddedNames = new Set(
+      itinerary.days.flatMap((d) =>
+        d.activities.map((a) => a.placeName.toLowerCase().trim())
+      )
+    );
+
+    const candidates = itinerary.candidatePlaces || [];
+    const activeDayNumber =
+      typeof selectedDay === "number"
+        ? selectedDay
+        : itinerary.days[0]?.day || 1;
+
+    candidates.forEach((cand, candIdx) => {
+      const normalizedName = cand.placeName.toLowerCase().trim();
+      if (
+        addedPlaceNames.has(normalizedName) ||
+        allDaysAddedNames.has(normalizedName)
+      ) {
+        return;
+      }
+
+      const rawLat = cand.location?.lat;
+      const rawLng = cand.location?.lng;
+      if (typeof rawLat !== "number" || typeof rawLng !== "number") return;
+
+      let displayLat = rawLat;
+      let displayLng = rawLng;
+      const nearbyCount = placedPositions.filter(
+        (pos) =>
+          Math.abs(pos.lat - rawLat) < 0.00035 &&
+          Math.abs(pos.lng - rawLng) < 0.00035
+      ).length;
+
+      if (nearbyCount > 0) {
+        const angle = (nearbyCount * 2 * Math.PI) / 6;
+        const offsetRadius = 0.00045 * Math.ceil(nearbyCount / 6);
+        displayLat = rawLat + Math.sin(angle) * offsetRadius;
+        displayLng = rawLng + Math.cos(angle) * offsetRadius;
+      }
+      placedPositions.push({ lat: rawLat, lng: rawLng });
+
+      const latLng: L.LatLngExpression = [displayLat, displayLng];
+      // Include candidate points in bounds if current day has 0 added activities or viewing all
+      if (allBoundsPoints.length === 0 || selectedDay === "all") {
+        allBoundsPoints.push(latLng);
+      }
+
+      const catConfig =
+        CATEGORY_CONFIG[cand.category] || CATEGORY_CONFIG.sightseeing;
+
+      const candidateIcon = L.divIcon({
+        className: "socialtrip-candidate-pin",
+        html: `
+          <div style="
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 28px;
+            height: 28px;
+            border-radius: 9999px;
+            background: #ffffff;
+            color: ${catConfig.color};
+            font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+            font-weight: 800;
+            font-size: 15px;
+            border: 2.5px dashed ${catConfig.color};
+            box-shadow: 0 3px 10px rgba(15, 23, 42, 0.22);
+            cursor: pointer;
+          ">+</div>
+        `,
+        iconSize: [28, 28],
+        iconAnchor: [14, 14],
+        popupAnchor: [0, -14],
+      });
+
+      const popupContainer = document.createElement("div");
+      popupContainer.style.fontFamily =
+        "'Plus Jakarta Sans', system-ui, -apple-system, sans-serif";
+      popupContainer.style.minWidth = "195px";
+      popupContainer.style.maxWidth = "240px";
+      popupContainer.style.padding = "2px";
+
+      popupContainer.innerHTML = `
+        <div style="font-size: 10.5px; color: #0d9488; margin-bottom: 3px; font-weight: 700; text-transform: uppercase;">
+          Kandidat AI${cand.city ? ` • ${escapeHtml(cand.city)}` : ""}
+        </div>
+        <div style="font-weight: 700; font-size: 13.5px; color: #0f172a; margin-bottom: 4px; line-height: 1.3;">
+          ${escapeHtml(cand.placeName)}
+        </div>
+        <p style="font-size: 12px; color: #475569; margin: 0 0 8px 0; line-height: 1.45;">
+          ${escapeHtml(cand.description)}
+        </p>
+      `;
+
+      const addBtn = document.createElement("button");
+      addBtn.type = "button";
+      addBtn.textContent = `+ Add ke Hari ${activeDayNumber}`;
+      addBtn.style.cssText = `
+        width: 100%;
+        padding: 6px 10px;
+        border-radius: 8px;
+        background: #005c55;
+        color: #ffffff;
+        font-weight: 700;
+        font-size: 11.5px;
+        border: none;
+        cursor: pointer;
+      `;
+      addBtn.onclick = () => {
+        onAddCandidateRef.current?.(cand);
+        map.closePopup();
+      };
+      popupContainer.appendChild(addBtn);
+
+      const candKey = cand.id || `cand-${candIdx}`;
+      const marker = L.marker(latLng, {
+        icon: candidateIcon,
+        zIndexOffset: 10,
+      }).bindPopup(popupContainer, { maxWidth: 250 });
+
+      marker.addTo(layerGroup);
+      markersMapRef.current.set(`cand-${candKey}`, marker);
+    });
+
+    // If current day was empty, ensure bounds cover all placed markers
+    const pointsToFit =
+      allBoundsPoints.length > 0
+        ? allBoundsPoints
+        : placedPositions.map(
+            (p): L.LatLngExpression => [p.lat, p.lng]
+          );
+
+    if (pointsToFit.length > 0) {
+      const bounds = L.latLngBounds(pointsToFit);
       setTimeout(() => {
         map.invalidateSize();
         map.fitBounds(bounds, { padding: [56, 56], maxZoom: 15 });
@@ -231,7 +378,9 @@ export default function LeafletMap({
 
   useEffect(() => {
     if (!focusedStop || !mapInstanceRef.current) return;
-    const key = `${focusedStop.day}-${focusedStop.activityIndex}`;
+    const key = focusedStop.candidateId
+      ? `cand-${focusedStop.candidateId}`
+      : `${focusedStop.day}-${focusedStop.activityIndex}`;
     const marker = markersMapRef.current.get(key);
     if (marker) {
       mapInstanceRef.current.invalidateSize();
@@ -275,6 +424,14 @@ export default function LeafletMap({
               </span>
             </div>
           ))}
+          <div className="flex items-center gap-1.5 pl-1 border-l border-slate-200">
+            <span className="w-3.5 h-3.5 rounded-full border border-dashed border-primary text-primary text-[10px] font-extrabold inline-flex items-center justify-center shrink-0">
+              +
+            </span>
+            <span className="text-[11px] text-slate-500 font-medium whitespace-nowrap">
+              Kandidat AI
+            </span>
+          </div>
         </div>
 
         {/* Reset View Button */}
