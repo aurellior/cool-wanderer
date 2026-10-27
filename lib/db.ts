@@ -13,6 +13,9 @@ interface DatabaseSchema {
   records: Record<string, StoredItineraryRecord>;
 }
 
+const CLOUD_KV_APP_KEY =
+  process.env.CLOUD_KV_APP_KEY || "q3l656rj";
+
 // 1. Upstash Redis / Vercel KV REST credentials
 function getKvConfig() {
   const url =
@@ -83,35 +86,188 @@ function writeDbFile(db: DatabaseSchema): void {
   }
 }
 
-export function generateItineraryId(): string {
-  const rand = Math.random().toString(36).substring(2, 8);
+export function generateItineraryId(suffix?: string): string {
+  const rand =
+    suffix || Math.random().toString(36).substring(2, 8);
   return `cw_${Date.now()}_${rand}`;
+}
+
+// Zero-config persistent cloud storage across serverless instances
+async function saveToCloudStore(
+  record: StoredItineraryRecord,
+  useBlobKeyInNewId: boolean
+): Promise<StoredItineraryRecord | null> {
+  try {
+    const postRes = await fetch("https://bytebin.lucko.me/post", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "cool-wanderer/1.0",
+      },
+      body: JSON.stringify(record),
+    });
+
+    if (!postRes.ok) {
+      return null;
+    }
+
+    const postData = (await postRes.json()) as { key?: string };
+    const blobKey = postData?.key?.trim();
+    if (!blobKey) {
+      return null;
+    }
+
+    const finalId = useBlobKeyInNewId
+      ? generateItineraryId(blobKey)
+      : record.id;
+
+    const finalRecord: StoredItineraryRecord = {
+      ...record,
+      id: finalId,
+      itinerary: {
+        ...record.itinerary,
+        id: finalId,
+      },
+    };
+
+    const safeId = encodeURIComponent(finalId);
+    await Promise.allSettled([
+      fetch(
+        `https://keyvalue.immanuel.co/api/KeyVal/UpdateValue/${CLOUD_KV_APP_KEY}/${safeId}/${encodeURIComponent(
+          blobKey
+        )}`,
+        { method: "POST", cache: "no-store" }
+      ),
+      fetch(`https://ntfy.sh/cw_idx_${safeId}`, {
+        method: "POST",
+        body: blobKey,
+        cache: "no-store",
+      }),
+    ]);
+
+    return finalRecord;
+  } catch (err) {
+    console.warn("Cloud store save failed:", err);
+    return null;
+  }
+}
+
+async function getFromCloudStore(
+  id: string
+): Promise<StoredItineraryRecord | null> {
+  const cleanId = id.trim();
+  const safeId = encodeURIComponent(cleanId);
+  let pointerKey: string | null = null;
+
+  // 1. Check primary cloud KV pointer index
+  try {
+    const kvRes = await fetch(
+      `https://keyvalue.immanuel.co/api/KeyVal/GetValue/${CLOUD_KV_APP_KEY}/${safeId}`,
+      { cache: "no-store" }
+    );
+    if (kvRes.ok) {
+      const text = (await kvRes.text()).replace(/"/g, "").trim();
+      if (text === "DELETED") return null;
+      if (text && /^[A-Za-z0-9]+$/.test(text)) {
+        pointerKey = text;
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  // 2. Fallback to secondary ntfy pointer index
+  if (!pointerKey) {
+    try {
+      const ntfyRes = await fetch(
+        `https://ntfy.sh/cw_idx_${safeId}/json?poll=1`,
+        { cache: "no-store" }
+      );
+      if (ntfyRes.ok) {
+        const lines = (await ntfyRes.text())
+          .trim()
+          .split("\n")
+          .filter(Boolean);
+        if (lines.length > 0) {
+          const last = JSON.parse(lines[lines.length - 1]) as {
+            message?: string;
+          };
+          const msg = last?.message?.trim();
+          if (msg === "DELETED") return null;
+          if (msg && /^[A-Za-z0-9]+$/.test(msg)) {
+            pointerKey = msg;
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  // 3. Also extract embedded blob key from cw_<timestamp>_<blobKey> if present
+  let embeddedKey: string | null = null;
+  if (cleanId.startsWith("cw_")) {
+    const parts = cleanId.split("_");
+    if (parts.length >= 3 && /^[A-Za-z0-9]{7,}$/.test(parts[2])) {
+      embeddedKey = parts[2];
+    }
+  }
+
+  const candidateKeys = Array.from(
+    new Set([pointerKey, embeddedKey].filter((k): k is string => Boolean(k)))
+  );
+
+  for (const key of candidateKeys) {
+    try {
+      const blobRes = await fetch(`https://bytebin.lucko.me/${key}`, {
+        headers: { "User-Agent": "cool-wanderer/1.0" },
+        cache: "no-store",
+      });
+      if (blobRes.ok) {
+        const parsed = (await blobRes.json()) as StoredItineraryRecord;
+        if (parsed && parsed.itinerary) {
+          return {
+            ...parsed,
+            id: cleanId,
+            itinerary: {
+              ...parsed.itinerary,
+              id: cleanId,
+            },
+          };
+        }
+      }
+    } catch {
+      // try next candidate key
+    }
+  }
+
+  return null;
 }
 
 export async function saveItineraryToDb(
   itinerary: ItineraryData
 ): Promise<StoredItineraryRecord> {
-  const id =
-    itinerary.id && !itinerary.id.startsWith("trip-")
-      ? itinerary.id
-      : generateItineraryId();
+  const hasExistingCwId = Boolean(
+    itinerary.id && itinerary.id.startsWith("cw_")
+  );
+  const initialId = hasExistingCwId
+    ? itinerary.id!
+    : generateItineraryId();
 
-  const updatedItinerary: ItineraryData = {
-    ...itinerary,
-    id,
-  };
-
-  const record: StoredItineraryRecord = {
-    id,
+  let record: StoredItineraryRecord = {
+    id: initialId,
     createdAt: new Date().toISOString(),
-    itinerary: updatedItinerary,
+    itinerary: {
+      ...itinerary,
+      id: initialId,
+    },
   };
 
   // 1. Try Vercel KV / Upstash Redis if configured in Vercel Environment Variables
   const kv = getKvConfig();
   if (kv) {
     try {
-      const key = `itinerary:${id}`;
+      const key = `itinerary:${record.id}`;
       await fetch(`${kv.url}/set/${encodeURIComponent(key)}`, {
         method: "POST",
         headers: {
@@ -120,31 +276,41 @@ export async function saveItineraryToDb(
         },
         body: JSON.stringify(record),
       });
-      return record;
     } catch (kvErr) {
-      console.warn("Vercel KV set failed, falling back to local file:", kvErr);
+      console.warn("Vercel KV set failed:", kvErr);
     }
   }
 
-  // 2. Fallback to file storage (/tmp on Vercel or data/ locally)
+  // 2. Save to Zero-Config Cloud Store so shared ?id= links work across all Vercel serverless instances
+  const cloudSaved = await saveToCloudStore(record, !hasExistingCwId);
+  if (cloudSaved) {
+    record = cloudSaved;
+  }
+
+  // 3. Also save to local /tmp or data/ file cache
   const db = ensureDbFile();
-  db.records[id] = record;
+  db.records[record.id] = record;
   writeDbFile(db);
+
   return record;
 }
 
 export async function getItineraryByIdFromDb(
   id: string
 ): Promise<StoredItineraryRecord | null> {
+  const cleanId = id.trim();
+  if (!cleanId) return null;
+
   // 1. Try Vercel KV / Upstash Redis if configured
   const kv = getKvConfig();
   if (kv) {
     try {
-      const key = `itinerary:${id}`;
+      const key = `itinerary:${cleanId}`;
       const res = await fetch(`${kv.url}/get/${encodeURIComponent(key)}`, {
         headers: {
           Authorization: `Bearer ${kv.token}`,
         },
+        cache: "no-store",
       });
       if (res.ok) {
         const data = await res.json();
@@ -155,23 +321,35 @@ export async function getItineraryByIdFromDb(
         }
       }
     } catch (kvErr) {
-      console.warn("Vercel KV get failed, falling back to local file:", kvErr);
+      console.warn("Vercel KV get failed:", kvErr);
     }
   }
 
-  // 2. Fallback to file storage
+  // 2. Try Zero-Config Cloud Store (works across all Vercel serverless instances)
+  const cloudRecord = await getFromCloudStore(cleanId);
+  if (cloudRecord) {
+    const db = ensureDbFile();
+    db.records[cleanId] = cloudRecord;
+    writeDbFile(db);
+    return cloudRecord;
+  }
+
+  // 3. Fallback to local file storage
   const db = ensureDbFile();
-  return db.records[id] || null;
+  return db.records[cleanId] || null;
 }
 
 export async function getItinerariesByIdsFromDb(
   ids: string[]
 ): Promise<StoredItineraryRecord[]> {
+  const cleanIds = ids.map((s) => s.trim()).filter(Boolean);
+  if (cleanIds.length === 0) return [];
+
   const kv = getKvConfig();
-  if (kv && ids.length > 0) {
+  if (kv) {
     try {
       const results = await Promise.all(
-        ids.map((id) => getItineraryByIdFromDb(id))
+        cleanIds.map((id) => getItineraryByIdFromDb(id))
       );
       return results.filter((r): r is StoredItineraryRecord => Boolean(r));
     } catch (kvErr) {
@@ -179,17 +357,38 @@ export async function getItinerariesByIdsFromDb(
     }
   }
 
+  // Check local file first, and for any missing IDs fetch from cloud store
   const db = ensureDbFile();
-  return ids
-    .map((id) => db.records[id])
-    .filter((rec): rec is StoredItineraryRecord => Boolean(rec));
+  let dbUpdated = false;
+
+  const resolved = await Promise.all(
+    cleanIds.map(async (id) => {
+      if (db.records[id]) {
+        return db.records[id];
+      }
+      const fromCloud = await getFromCloudStore(id);
+      if (fromCloud) {
+        db.records[id] = fromCloud;
+        dbUpdated = true;
+        return fromCloud;
+      }
+      return null;
+    })
+  );
+
+  if (dbUpdated) {
+    writeDbFile(db);
+  }
+
+  return resolved.filter((rec): rec is StoredItineraryRecord => Boolean(rec));
 }
 
 export async function deleteItineraryFromDb(id: string): Promise<boolean> {
+  const cleanId = id.trim();
   const kv = getKvConfig();
   if (kv) {
     try {
-      const key = `itinerary:${id}`;
+      const key = `itinerary:${cleanId}`;
       await fetch(`${kv.url}/del/${encodeURIComponent(key)}`, {
         method: "POST",
         headers: {
@@ -201,9 +400,22 @@ export async function deleteItineraryFromDb(id: string): Promise<boolean> {
     }
   }
 
+  const safeId = encodeURIComponent(cleanId);
+  await Promise.allSettled([
+    fetch(
+      `https://keyvalue.immanuel.co/api/KeyVal/UpdateValue/${CLOUD_KV_APP_KEY}/${safeId}/DELETED`,
+      { method: "POST", cache: "no-store" }
+    ),
+    fetch(`https://ntfy.sh/cw_idx_${safeId}`, {
+      method: "POST",
+      body: "DELETED",
+      cache: "no-store",
+    }),
+  ]);
+
   const db = ensureDbFile();
-  if (db.records[id]) {
-    delete db.records[id];
+  if (db.records[cleanId]) {
+    delete db.records[cleanId];
     writeDbFile(db);
     return true;
   }
