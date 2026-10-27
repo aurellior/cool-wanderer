@@ -20,7 +20,7 @@ export async function POST(req: NextRequest) {
         ...ITINERARY_PRESETS[presetId],
         id: generateItineraryId(),
       });
-      const savedRecord = saveItineraryToDb(preset);
+      const savedRecord = await saveItineraryToDb(preset);
 
       return NextResponse.json({
         id: savedRecord.id,
@@ -59,7 +59,7 @@ export async function POST(req: NextRequest) {
     const { itinerary, usedAi } = await generateItineraryFromMetadata(metadata);
 
     // 4. Save generated itinerary to persistent DB and return the DB record ID
-    const savedRecord = saveItineraryToDb({
+    const savedRecord = await saveItineraryToDb({
       ...itinerary,
       id: generateItineraryId(),
     });

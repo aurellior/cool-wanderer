@@ -12,7 +12,7 @@ export async function GET(req: NextRequest) {
     const multipleIdsParam = searchParams.get("ids");
 
     if (singleId) {
-      const record = getItineraryByIdFromDb(singleId);
+      const record = await getItineraryByIdFromDb(singleId);
       if (!record) {
         return NextResponse.json(
           { error: "Itinerary tidak ditemukan di database." },
@@ -27,7 +27,7 @@ export async function GET(req: NextRequest) {
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean);
-      const records = getItinerariesByIdsFromDb(ids);
+      const records = await getItinerariesByIdsFromDb(ids);
       return NextResponse.json({ records });
     }
 
@@ -51,7 +51,7 @@ export async function DELETE(req: NextRequest) {
         { status: 400 }
       );
     }
-    const deleted = deleteItineraryFromDb(id);
+    const deleted = await deleteItineraryFromDb(id);
     return NextResponse.json({ deleted });
   } catch (error) {
     console.error("Error in DELETE /api/itineraries:", error);
