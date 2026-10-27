@@ -12,6 +12,10 @@ export interface ExtractedSocialMetadata {
     mimeType: string;
     data: string; // base64
   };
+  mediaInlineList?: Array<{
+    mimeType: string;
+    data: string; // base64
+  }>;
 }
 
 export function detectPlatform(
@@ -60,30 +64,40 @@ function stripHtmlTags(html: string): string {
 async function fetchMediaAsBase64(
   mediaUrl: string,
   defaultMimeType: string,
-  maxBytes = 12 * 1024 * 1024
+  referer = "https://www.instagram.com/",
+  maxBytes = 18 * 1024 * 1024
 ): Promise<{ mimeType: string; data: string } | undefined> {
   try {
     const res = await fetch(mediaUrl, {
       headers: {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        Referer: "https://www.instagram.com/",
+        Referer: referer,
       },
-      signal: AbortSignal.timeout(7000),
+      signal: AbortSignal.timeout(12000),
     });
     if (!res.ok) return undefined;
 
     const contentLength = Number(res.headers.get("content-length") || "0");
     if (contentLength > maxBytes) return undefined;
 
+    const contentType =
+      res.headers.get("content-type")?.split(";")[0]?.trim() ||
+      defaultMimeType;
+
+    // Avoid passing raw MP3 audio streams when a video/image is expected
+    if (
+      defaultMimeType.startsWith("video/") &&
+      contentType.startsWith("audio/")
+    ) {
+      return undefined;
+    }
+
     const arrayBuffer = await res.arrayBuffer();
     if (arrayBuffer.byteLength > maxBytes || arrayBuffer.byteLength < 500) {
       return undefined;
     }
 
-    const contentType =
-      res.headers.get("content-type")?.split(";")[0]?.trim() ||
-      defaultMimeType;
     const base64 = Buffer.from(arrayBuffer).toString("base64");
     return { mimeType: contentType, data: base64 };
   } catch {
@@ -102,7 +116,7 @@ export async function extractSocialMetadata(
   // =========================================================================
   if (platform === "instagram") {
     const shortcodeMatch = url.match(
-      /instagram\.com\/(?:reel|reels|p|tv)\/([A-Za-z0-9_-]+)/i
+      /(?:instagram\.com|instagr\.am)\/(?:[^/]+\/)?(?:reel|reels|p|tv)\/([A-Za-z0-9_-]+)/i
     );
     const shortcode = shortcodeMatch ? shortcodeMatch[1] : null;
 
@@ -110,6 +124,7 @@ export async function extractSocialMetadata(
     let author = "@instagram_creator";
     let videoUrl = "";
     let imageUrl = "";
+    const carouselImageUrls: string[] = [];
 
     if (shortcode) {
       // 1A. Fetch Instagram's public /embed/captioned/ endpoint
@@ -159,9 +174,24 @@ export async function extractSocialMetadata(
             videoUrl = decodeHtmlEntities(videoUrlMatch[1]);
           }
 
+          // Collect all display_url occurrences for multi-slide carousels
+          const allDisplayMatches = [
+            ...html.matchAll(/display_url\\?":\\?"(https:[^"\\]+)\\?"/gi),
+          ];
+          for (const m of allDisplayMatches) {
+            if (m[1]) {
+              const decodedUrl = decodeHtmlEntities(m[1]);
+              if (!carouselImageUrls.includes(decodedUrl)) {
+                carouselImageUrls.push(decodedUrl);
+              }
+            }
+          }
+
           const displayUrlMatch =
             html.match(/display_url\\?":\\?"(https:[^"\\]+)\\?"/i) ||
-            html.match(/class=["']EmbeddedMediaImage["'][^>]*src=["']([^"']+)["']/i);
+            html.match(
+              /class=["']EmbeddedMediaImage["'][^>]*src=["']([^"']+)["']/i
+            );
           if (displayUrlMatch && displayUrlMatch[1]) {
             imageUrl = decodeHtmlEntities(displayUrlMatch[1]);
           }
@@ -230,13 +260,39 @@ export async function extractSocialMetadata(
       }
     }
 
-    // Download video or thumbnail image so Gemini can inspect the actual Reel visually/audibly
+    // Download video or carousel images so Gemini can inspect the actual Reel/Post visually/audibly
     let mediaInline: { mimeType: string; data: string } | undefined;
+    let mediaInlineList: Array<{ mimeType: string; data: string }> | undefined;
+
     if (videoUrl) {
-      mediaInline = await fetchMediaAsBase64(videoUrl, "video/mp4");
+      mediaInline = await fetchMediaAsBase64(
+        videoUrl,
+        "video/mp4",
+        "https://www.instagram.com/"
+      );
+    }
+    if (!mediaInline && carouselImageUrls.length > 1) {
+      const downloadedSlides = await Promise.all(
+        carouselImageUrls
+          .slice(0, 10)
+          .map((u) =>
+            fetchMediaAsBase64(u, "image/jpeg", "https://www.instagram.com/")
+          )
+      );
+      const validSlides = downloadedSlides.filter(
+        (item): item is { mimeType: string; data: string } => Boolean(item)
+      );
+      if (validSlides.length > 0) {
+        mediaInlineList = validSlides;
+        mediaInline = validSlides[0];
+      }
     }
     if (!mediaInline && imageUrl) {
-      mediaInline = await fetchMediaAsBase64(imageUrl, "image/jpeg");
+      mediaInline = await fetchMediaAsBase64(
+        imageUrl,
+        "image/jpeg",
+        "https://www.instagram.com/"
+      );
     }
 
     const combined = [extractedCaption, fallbackCaption]
@@ -244,7 +300,7 @@ export async function extractSocialMetadata(
       .join("\n\n")
       .trim();
 
-    if (combined.length > 0 || mediaInline) {
+    if (combined.length > 0 || mediaInline || mediaInlineList?.length) {
       return {
         url,
         platform,
@@ -252,17 +308,18 @@ export async function extractSocialMetadata(
         author,
         caption: combined,
         tags: extractHashtags(combined),
-        rawText: `Platform: Instagram Reels\nAuthor: ${author}\nURL: ${url}\nCaption & Konten Ekstraksi:\n${
-          combined || "(Lihat konten visual/audio video terlampir)"
+        rawText: `Platform: Instagram\nAuthor: ${author}\nURL: ${url}\nCaption & Konten Ekstraksi:\n${
+          combined || "(Lihat konten visual/audio video/slide terlampir)"
         }`,
         extractedSuccessfully: true,
         mediaInline,
+        mediaInlineList,
       };
     }
   }
 
   // =========================================================================
-  // 2. TIKTOK: TikWM API (Caption + Video Stream) + Official oEmbed
+  // 2. TIKTOK: TikWM API (Caption + Video Stream / Photo Carousel) + Official oEmbed
   // =========================================================================
   if (platform === "tiktok") {
     try {
@@ -270,7 +327,7 @@ export async function extractSocialMetadata(
         url
       )}`;
       const res = await fetch(tikwmUrl, {
-        signal: AbortSignal.timeout(7000),
+        signal: AbortSignal.timeout(8000),
       });
       if (res.ok) {
         const json = await res.json();
@@ -280,14 +337,61 @@ export async function extractSocialMetadata(
             ? `@${json.data.author.unique_id}`
             : "@tiktok_creator";
           const playUrl = (json.data.play as string) || "";
+          const wmplayUrl = (json.data.wmplay as string) || "";
           const coverUrl = (json.data.cover as string) || "";
+          const slideImages: string[] = Array.isArray(json.data.images)
+            ? json.data.images
+            : [];
 
           let mediaInline: { mimeType: string; data: string } | undefined;
-          if (playUrl) {
-            mediaInline = await fetchMediaAsBase64(playUrl, "video/mp4");
+          let mediaInlineList:
+            | Array<{ mimeType: string; data: string }>
+            | undefined;
+
+          // 2A. If TikTok post is a Photo Carousel ("Top 10 Places" slide post)
+          if (slideImages.length > 0) {
+            const downloadedSlides = await Promise.all(
+              slideImages
+                .slice(0, 10)
+                .map((imgUrl) =>
+                  fetchMediaAsBase64(
+                    imgUrl,
+                    "image/jpeg",
+                    "https://www.tiktok.com/"
+                  )
+                )
+            );
+            const validSlides = downloadedSlides.filter(
+              (item): item is { mimeType: string; data: string } =>
+                Boolean(item)
+            );
+            if (validSlides.length > 0) {
+              mediaInlineList = validSlides;
+              mediaInline = validSlides[0];
+            }
+          }
+
+          // 2B. Otherwise download TikTok video stream (try playUrl, then compressed wmplayUrl)
+          if (!mediaInline && playUrl && !playUrl.endsWith(".mp3")) {
+            mediaInline = await fetchMediaAsBase64(
+              playUrl,
+              "video/mp4",
+              "https://www.tiktok.com/"
+            );
+          }
+          if (!mediaInline && wmplayUrl && !wmplayUrl.endsWith(".mp3")) {
+            mediaInline = await fetchMediaAsBase64(
+              wmplayUrl,
+              "video/mp4",
+              "https://www.tiktok.com/"
+            );
           }
           if (!mediaInline && coverUrl) {
-            mediaInline = await fetchMediaAsBase64(coverUrl, "image/jpeg");
+            mediaInline = await fetchMediaAsBase64(
+              coverUrl,
+              "image/jpeg",
+              "https://www.tiktok.com/"
+            );
           }
 
           const combined = [title, fallbackCaption].filter(Boolean).join("\n");
@@ -298,9 +402,10 @@ export async function extractSocialMetadata(
             author,
             caption: combined,
             tags: extractHashtags(combined),
-            rawText: `Platform: TikTok\nAuthor: ${author}\nURL: ${url}\nCaption Lengkap:\n${combined}`,
+            rawText: `Platform: TikTok\nAuthor: ${author}\nURL: ${url}\nJumlah Slide Foto: ${slideImages.length}\nCaption Lengkap:\n${combined}`,
             extractedSuccessfully: true,
             mediaInline,
+            mediaInlineList,
           };
         }
       }
@@ -345,11 +450,11 @@ export async function extractSocialMetadata(
   }
 
   // =========================================================================
-  // 3. YOUTUBE SHORTS / VIDEOS: Title + Full Description + Native Video URI
+  // 3. YOUTUBE SHORTS / VIDEOS: Title + Full Description + Chapters + Native Video URI
   // =========================================================================
   if (platform === "youtube") {
     const ytIdMatch = url.match(
-      /(?:youtube\.com\/(?:shorts\/|watch\?v=)|youtu\.be\/)([A-Za-z0-9_-]{11})/i
+      /(?:youtube\.com\/(?:shorts\/|live\/|watch\?v=)|youtu\.be\/)([A-Za-z0-9_-]{11})/i
     );
     const videoId = ytIdMatch ? ytIdMatch[1] : null;
     const youtubeWatchUrl = videoId
@@ -375,6 +480,8 @@ export async function extractSocialMetadata(
     }
 
     let fullDescription = "";
+    let chaptersText = "";
+    let keywordsText = "";
     try {
       const pageRes = await fetch(youtubeWatchUrl || url, {
         headers: {
@@ -382,7 +489,7 @@ export async function extractSocialMetadata(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
           "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
         },
-        signal: AbortSignal.timeout(7000),
+        signal: AbortSignal.timeout(8000),
       });
       if (pageRes.ok) {
         const html = await pageRes.text();
@@ -392,23 +499,55 @@ export async function extractSocialMetadata(
         if (shortDescMatch) {
           fullDescription = decodeHtmlEntities(shortDescMatch[1]);
         }
+
+        // Extract YouTube video chapters (often lists each place in a Top 10 video!)
+        const chapterMatches = [
+          ...html.matchAll(
+            /"macroMarkersListItemRenderer":\{"title":\{"simpleText":"((?:[^"\\]|\\.)*)"\},"timeDescription":\{"simpleText":"((?:[^"\\]|\\.)*)"\}/g
+          ),
+        ];
+        if (chapterMatches.length > 0) {
+          const uniqueChapters = Array.from(
+            new Set(
+              chapterMatches.map(
+                (m) =>
+                  `${decodeHtmlEntities(m[2])} - ${decodeHtmlEntities(m[1])}`
+              )
+            )
+          );
+          chaptersText = uniqueChapters.join("\n");
+        }
+
+        const kwMatch = html.match(/"keywords":\[([^\]]+)\]/);
+        if (kwMatch && kwMatch[1]) {
+          keywordsText = decodeHtmlEntities(kwMatch[1].replace(/"/g, ""));
+        }
       }
     } catch {
       // ignore
     }
 
-    const combined = [oembedTitle, fullDescription, fallbackCaption]
+    const combined = [
+      oembedTitle,
+      chaptersText ? `Daftar Bab/Timestamp Video:\n${chaptersText}` : "",
+      fullDescription,
+      fallbackCaption,
+    ]
       .filter(Boolean)
       .join("\n\n");
 
     return {
       url,
       platform,
-      title: oembedTitle || "YouTube Shorts Travel Guide",
+      title: oembedTitle || "YouTube Travel Guide",
       author: oembedAuthor || "@youtube_creator",
       caption: combined,
       tags: extractHashtags(combined),
-      rawText: `Platform: YouTube\nAuthor: ${oembedAuthor}\nURL: ${url}\nTitle: ${oembedTitle}\nDescription:\n${combined}`,
+      rawText: `Platform: YouTube\nAuthor: ${oembedAuthor}\nURL: ${url}\nTitle: ${oembedTitle}\n${
+        keywordsText ? `Keywords: ${keywordsText}\n` : ""
+      }${
+        chaptersText ? `Chapters:\n${chaptersText}\n` : ""
+      }Description:\n${combined}`,
       extractedSuccessfully: Boolean(combined.trim() || youtubeWatchUrl),
       youtubeWatchUrl,
     };
