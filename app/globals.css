@@ -20,6 +20,38 @@
   }
 }
 
+/* Prevent Material Symbols icon font ligature text from overflowing or overlapping adjacent text */
+.material-symbols-outlined {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1em;
+  height: 1em;
+  line-height: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  word-wrap: normal;
+  direction: ltr;
+  flex-shrink: 0;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Keep Leaflet controls below header dropdowns and above map tiles, and avoid mobile switcher overlap */
+.leaflet-container {
+  font-family: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif !important;
+  z-index: 10 !important;
+}
+
+@media (max-width: 1023px) {
+  .leaflet-bottom.leaflet-right {
+    margin-bottom: 4.5rem !important;
+  }
+  .leaflet-bottom.leaflet-left {
+    margin-bottom: 4.5rem !important;
+  }
+}
+
 .no-scrollbar::-webkit-scrollbar {
   display: none;
 }
