@@ -40,7 +40,23 @@ function ensureDbFile(): DatabaseSchema {
       fs.mkdirSync(DATA_DIR, { recursive: true });
     }
     if (!fs.existsSync(DB_FILE_PATH)) {
-      const initial: DatabaseSchema = { records: {} };
+      let initial: DatabaseSchema = { records: {} };
+      const bundledDbPath = path.join(
+        process.cwd(),
+        "data",
+        "itineraries-db.json"
+      );
+      if (isServerless && fs.existsSync(bundledDbPath)) {
+        try {
+          const bundledRaw = fs.readFileSync(bundledDbPath, "utf-8");
+          const bundledParsed = JSON.parse(bundledRaw) as DatabaseSchema;
+          if (bundledParsed && typeof bundledParsed.records === "object") {
+            initial = bundledParsed;
+          }
+        } catch {
+          // ignore
+        }
+      }
       fs.writeFileSync(DB_FILE_PATH, JSON.stringify(initial, null, 2), "utf-8");
       return initial;
     }

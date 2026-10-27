@@ -30,6 +30,8 @@ import {
 } from "lucide-react";
 
 const HISTORY_IDS_STORAGE_KEY = "cool_wanderer_history_ids";
+const HISTORY_CACHE_STORAGE_KEY = "cool_wanderer_history_cache";
+const ACTIVE_ID_STORAGE_KEY = "cool_wanderer_active_id";
 
 interface HistoryRecord {
   id: string;
@@ -98,6 +100,53 @@ function saveIdsToLocalStorage(ids: string[]): void {
   }
 }
 
+function getCachedRecordsFromLocalStorage(): HistoryRecord[] {
+  try {
+    const raw = localStorage.getItem(HISTORY_CACHE_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter(
+          (item): item is HistoryRecord =>
+            Boolean(item && typeof item.id === "string" && item.itinerary)
+        )
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveCachedRecordsToLocalStorage(records: HistoryRecord[]): void {
+  try {
+    localStorage.setItem(
+      HISTORY_CACHE_STORAGE_KEY,
+      JSON.stringify(records.slice(0, 25))
+    );
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function getActiveIdFromLocalStorage(): string | null {
+  try {
+    return localStorage.getItem(ACTIVE_ID_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function saveActiveIdToLocalStorage(id: string | null): void {
+  try {
+    if (id) {
+      localStorage.setItem(ACTIVE_ID_STORAGE_KEY, id);
+    } else {
+      localStorage.removeItem(ACTIVE_ID_STORAGE_KEY);
+    }
+  } catch {
+    // ignore
+  }
+}
+
 function renderTransitIcon(iconName: string) {
   switch (iconName) {
     case "directions_walk":
@@ -112,14 +161,13 @@ function renderTransitIcon(iconName: string) {
 }
 
 export default function SocialTripWorkspace() {
-  // Start EMPTY on initial page load unless ?id= is in URL
   const [itinerary, setItinerary] = useState<ItineraryData | null>(null);
   const [activeRecordId, setActiveRecordId] = useState<string | null>(null);
   const [activeDay, setActiveDay] = useState<number>(1);
   const [focusedStop, setFocusedStop] = useState<FocusedStop | null>(null);
   const [activeStopIdx, setActiveStopIdx] = useState<number | null>(null);
 
-  // History state loaded from DB using IDs stored in localStorage
+  // History state loaded from localStorage + DB
   const [historyRecords, setHistoryRecords] = useState<HistoryRecord[]>([]);
   const [isLoadingHistory, setIsLoadingHistory] = useState<boolean>(true);
   const [historyDropdownOpen, setHistoryDropdownOpen] =
@@ -170,6 +218,8 @@ export default function SocialTripWorkspace() {
       setItinerary(newTrip);
       const finalId = recordId || newTrip.id || null;
       setActiveRecordId(finalId);
+      saveActiveIdToLocalStorage(finalId);
+
       const targetDay =
         preferredDay && newTrip.days.some((d) => d.day === preferredDay)
           ? preferredDay
@@ -193,55 +243,120 @@ export default function SocialTripWorkspace() {
     []
   );
 
-  // Fetch history records from DB based on IDs stored in localStorage
-  const fetchHistoryFromDb = useCallback(async () => {
+  // Load history & active itinerary from localStorage first, then sync with DB
+  const hydrateAndSyncHistory = useCallback(async () => {
+    const cachedRecords = getCachedRecordsFromLocalStorage();
     const savedIds = getSavedIdsFromLocalStorage();
-    if (savedIds.length === 0) {
+
+    // Ensure savedIds includes any cached record IDs
+    const mergedIds = Array.from(
+      new Set([...savedIds, ...cachedRecords.map((r) => r.id)])
+    ).slice(0, 25);
+
+    if (mergedIds.length !== savedIds.length) {
+      saveIdsToLocalStorage(mergedIds);
+    }
+
+    // Immediately show localStorage cached records so refresh never loses data
+    if (cachedRecords.length > 0) {
+      setHistoryRecords(cachedRecords);
+    }
+
+    if (mergedIds.length === 0) {
       setHistoryRecords([]);
       setIsLoadingHistory(false);
-      return;
+      return cachedRecords;
     }
 
     try {
       const res = await fetch(
-        `/api/itineraries?ids=${encodeURIComponent(savedIds.join(","))}`
+        `/api/itineraries?ids=${encodeURIComponent(mergedIds.join(","))}`
       );
       if (res.ok) {
         const data = await res.json();
-        if (Array.isArray(data.records)) {
-          setHistoryRecords(data.records);
-          const validIds = data.records.map((r: HistoryRecord) => r.id);
-          saveIdsToLocalStorage(validIds);
+        if (Array.isArray(data.records) && data.records.length > 0) {
+          // Merge server DB records with localStorage cache (preserving order in mergedIds)
+          const recordMap = new Map<string, HistoryRecord>();
+          for (const rec of cachedRecords) {
+            recordMap.set(rec.id, rec);
+          }
+          for (const rec of data.records as HistoryRecord[]) {
+            recordMap.set(rec.id, rec);
+          }
+          const combined = mergedIds
+            .map((id) => recordMap.get(id))
+            .filter((r): r is HistoryRecord => Boolean(r));
+
+          setHistoryRecords(combined);
+          saveCachedRecordsToLocalStorage(combined);
+          saveIdsToLocalStorage(combined.map((r) => r.id));
+          setIsLoadingHistory(false);
+          return combined;
         }
       }
     } catch {
-      // ignore
+      // ignore network error and keep localStorage records
     } finally {
       setIsLoadingHistory(false);
     }
+
+    return cachedRecords;
   }, []);
 
-  // Initial load: fetch history list & check if ?id= is in URL
+  // Initial load: restore active itinerary & history from URL ?id= or localStorage
   useEffect(() => {
-    fetchHistoryFromDb();
+    let isMounted = true;
 
-    if (typeof window !== "undefined") {
-      const params = new URLSearchParams(window.location.search);
-      const urlId = params.get("id");
-      if (urlId) {
-        fetch(`/api/itineraries?id=${encodeURIComponent(urlId)}`)
-          .then((r) => (r.ok ? r.json() : null))
-          .then((data) => {
-            if (data?.record?.itinerary) {
-              applyItinerary(data.record.itinerary, data.record.id, 1);
+    async function init() {
+      const localCache = getCachedRecordsFromLocalStorage();
+      const params =
+        typeof window !== "undefined"
+          ? new URLSearchParams(window.location.search)
+          : null;
+      const targetId = params?.get("id") || getActiveIdFromLocalStorage();
+
+      // 1. Instant restore from localStorage cache if targetId exists
+      if (targetId) {
+        const cachedMatch = localCache.find((r) => r.id === targetId);
+        if (cachedMatch && isMounted) {
+          applyItinerary(cachedMatch.itinerary, cachedMatch.id, 1);
+        } else {
+          // Try fetching single ID from DB (e.g. shared URL link)
+          try {
+            const res = await fetch(
+              `/api/itineraries?id=${encodeURIComponent(targetId)}`
+            );
+            if (res.ok) {
+              const data = await res.json();
+              if (data?.record?.itinerary && isMounted) {
+                const fetchedRec: HistoryRecord = data.record;
+                const updatedCache = [
+                  fetchedRec,
+                  ...localCache.filter((r) => r.id !== fetchedRec.id),
+                ].slice(0, 25);
+                saveCachedRecordsToLocalStorage(updatedCache);
+                saveIdsToLocalStorage(updatedCache.map((r) => r.id));
+                applyItinerary(fetchedRec.itinerary, fetchedRec.id, 1);
+              }
             }
-          })
-          .catch(() => {});
+          } catch {
+            // ignore
+          }
+        }
       }
-    }
-  }, [fetchHistoryFromDb, applyItinerary]);
 
-  // Add a newly saved DB record ID to localStorage & history state
+      // 2. Sync full history list
+      await hydrateAndSyncHistory();
+    }
+
+    init();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [hydrateAndSyncHistory, applyItinerary]);
+
+  // Add a newly saved DB record ID + data to localStorage & history state
   const registerSavedRecord = useCallback(
     (record: HistoryRecord, preferredDay?: number) => {
       const currentIds = getSavedIdsFromLocalStorage();
@@ -251,11 +366,14 @@ export default function SocialTripWorkspace() {
       ].slice(0, 25);
       saveIdsToLocalStorage(updatedIds);
 
-      setHistoryRecords((prev) => [
+      const currentCache = getCachedRecordsFromLocalStorage();
+      const updatedCache = [
         record,
-        ...prev.filter((r) => r.id !== record.id),
-      ]);
+        ...currentCache.filter((r) => r.id !== record.id),
+      ].slice(0, 25);
+      saveCachedRecordsToLocalStorage(updatedCache);
 
+      setHistoryRecords(updatedCache);
       applyItinerary(record.itinerary, record.id, preferredDay);
     },
     [applyItinerary]
@@ -345,6 +463,12 @@ export default function SocialTripWorkspace() {
       (id) => id !== idToDelete
     );
     saveIdsToLocalStorage(updatedIds);
+
+    const updatedCache = getCachedRecordsFromLocalStorage().filter(
+      (r) => r.id !== idToDelete
+    );
+    saveCachedRecordsToLocalStorage(updatedCache);
+
     setHistoryRecords((prev) => prev.filter((r) => r.id !== idToDelete));
 
     if (activeRecordId === idToDelete) {
@@ -363,6 +487,7 @@ export default function SocialTripWorkspace() {
   const handleResetEmpty = () => {
     setItinerary(null);
     setActiveRecordId(null);
+    saveActiveIdToLocalStorage(null);
     setUrlInput("");
     setRawCaption("");
     setErrorMsg(null);
@@ -702,7 +827,7 @@ export default function SocialTripWorkspace() {
             </div>
           </div>
 
-          {/* ==================== SAVED HISTORY SECTION (FROM DB + LOCALSTORAGE IDS) ==================== */}
+          {/* ==================== SAVED HISTORY SECTION (FROM DB + LOCALSTORAGE) ==================== */}
           {!isLoadingHistory && historyRecords.length > 0 && (
             <div className="w-full max-w-xl bg-white rounded-3xl border border-slate-200/80 shadow-[0_4px_20px_rgba(15,23,42,0.03)] p-4 sm:p-6 flex flex-col gap-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
@@ -713,7 +838,7 @@ export default function SocialTripWorkspace() {
                   </h2>
                 </div>
                 <span className="text-[11px] text-slate-400">
-                  Tersimpan Otomatis
+                  Tersimpan di LocalStorage &amp; DB
                 </span>
               </div>
 
